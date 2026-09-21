@@ -31,7 +31,6 @@ import subprocess
 import re
 import socket
 import ipaddress
-import uuid
 
 from .model import *
 
@@ -47,6 +46,20 @@ def _redact_ipv6_candidate(match):
     return b'<ip>'
 
 
+_QUOTED_RE = re.compile(rb"'[^'\n]*'")
+# NetworkManager logs an SSID quoted, on a line that also names what it is
+# ("connection", "access point", "ssid"): "Activation: (wifi) connection
+# 'Home-WiFi' enable...", "Config: added 'ssid' value 'Home-WiFi' (9 bytes)".
+# Redacting every quoted token on such a line (rather than trying to pick
+# out only the SSID) also catches the literal 'ssid'/'connection' label
+# some of these messages quote, which is a harmless over-redaction.
+_WIFI_LINE_RE = re.compile(rb'(?i)^.*\b(?:wifi|ssid|access point)\b.*$', re.MULTILINE)
+
+
+def _redact_wifi_line(match):
+    return _QUOTED_RE.sub(b"'<ssid>'", match.group(0))
+
+
 # Every replacement below is a fixed literal placeholder, never the
 # matched value, so nothing sensitive can leak back in through the
 # substitution itself.
@@ -57,6 +70,11 @@ _REDACTIONS = [
     (re.compile(rb'\b[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-'
                 rb'[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}\b'),
         rb'<uuid>'),
+    # /etc/fstab and /etc/crypttab identify devices by UUID=/PARTUUID=; the
+    # short MBR-style PARTUUID form (e.g. 9e1e7f3c-01) isn't a full UUID
+    # and would otherwise pass the generic UUID pattern above untouched.
+    (re.compile(rb'\b((?:PART)?UUID=)[0-9A-Fa-f-]+', re.IGNORECASE),
+        rb'\1<uuid>'),
     (re.compile(rb'\b(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}\b'),
         rb'<mac>'),
     (re.compile(rb'\b(?!127\.0\.0\.1\b)(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.)'
@@ -65,6 +83,7 @@ _REDACTIONS = [
     (_IPV6_CANDIDATE_RE, _redact_ipv6_candidate),
     (re.compile(rb'/home/[^/\s]+/'),
         rb'/home/<user>/'),
+    (_WIFI_LINE_RE, _redact_wifi_line),
     (re.compile(rb'(password|passwd|token|apikey|api_key|secret)([ \t]*[:=][ \t]*)\S+',
                 re.IGNORECASE),
         rb'\1\2<redacted>'),
@@ -156,13 +175,13 @@ def dump_logs(base):
     dump_command(base, "free-disk-space", ["df", "-h"])
     dump_command(base, "dmesg", ["dmesg"])
     dump_command(base, "dmidecode", ["dmidecode"])
-    dump_command(base, "efibootmgr", ["efibootmgr", "-v"])
+    dump_command(base, "efibootmgr", ["efibootmgr"])
     dump_journal(base)
-    dump_command(base, "lsblk", ["lsblk", "-o", "NAME,MODEL,FSTYPE,FSVER,SIZE,FSUSE%,MOUNTPOINTS,LABEL,UUID"])
+    dump_command(base, "lsblk", ["lsblk", "-o", "NAME,MODEL,FSTYPE,FSVER,SIZE,FSUSE%,MOUNTPOINTS,LABEL"])
     dump_command(base, "lsmod", ["lsmod"])
     dump_command(base, "lspci", ["lspci", "-vv"])
     dump_command(base, "lsusb", ["lsusb", "-vv"])
-    dump_command(base, "reboot-history", ["last"])
+    dump_command(base, "reboot-history", ["last", "reboot"])
     dump_command(base, "sensors", ["sensors"])
     dump_command(base, "upower", ["upower"])
     dump_command(base, "uptime", ["uptime"])
@@ -170,14 +189,11 @@ def dump_logs(base):
     dump_path(base, "crypttab", "/etc/crypttab")
     dump_path(base, "kernelstub", "/etc/kernelstub/configuration")
     dump_path(base, "fstab", "/etc/fstab")
-    dump_path(base, "syslog", "/var/log/syslog")
     dump_path(base, "Xorg.log", "/var/log/Xorg.0.log")
     dump_path(base, "apt/sources.list", "/etc/apt/sources.list")
     dump_path(base, "apt/sources.list.d", "/etc/apt/sources.list.d")
     dump_path(base, "apt/history", "/var/log/apt/history.log")
-    dump_path(base, "apt/history-rotated.gz", "/var/log/apt/history.log.1.gz")
     dump_path(base, "apt/term", "/var/log/apt/term.log")
-    dump_path(base, "apt/term-rotated.gz", "/var/log/apt/term.log.1.gz")
 
 
 EXCLUDED_CATEGORIES = [
@@ -242,8 +258,8 @@ def create_logs(homedir, func=dump_logs):
 def send_logs():
     dst = path.join(os.environ['HOME'], "lud-logs.tgz")
     print(dst)
-    token = uuid.uuid4().hex[:12]
-    desturl = "https://drive.ekimia.fr/public.php/webdav/"+token+"-lud-logs.tgz"
+    hostname = subprocess.run('hostname', capture_output=True, shell=True, text=True).stdout.strip()
+    desturl = "https://drive.ekimia.fr/public.php/webdav/"+hostname+"-lud-logs.tgz"
     Curlcmd = "curl -verbose -X PUT -u 'publicupload:' -T "+dst+" "+desturl
     print(Curlcmd)
     status, output = subprocess.getstatusoutput(Curlcmd)

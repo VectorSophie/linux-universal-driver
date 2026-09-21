@@ -81,6 +81,14 @@ class TestRedactText(TestCase):
         self.assertNotIn(b'1b4e28ba-2fa1-11d2-883f-0016d3cca427', result)
         self.assertIn(b'<uuid>', result)
 
+    def test_fstab_partuuid_short_form(self):
+        # MBR-style PARTUUID (e.g. from /etc/fstab) isn't a full UUID and
+        # would otherwise pass the generic UUID pattern untouched.
+        data = b'PARTUUID=9e1e7f3c-01 /boot vfat defaults 0 2\n'
+        result = util.redact_text(data)
+        self.assertNotIn(b'9e1e7f3c-01', result)
+        self.assertIn(b'PARTUUID=<uuid>', result)
+
     def test_mac_address(self):
         data = b'eth0: link encap:Ethernet HWaddr 00:1A:2B:3C:4D:5E\n'
         result = util.redact_text(data)
@@ -126,6 +134,21 @@ class TestRedactText(TestCase):
         self.assertNotIn(hostname.encode(), result)
         self.assertIn(b'<hostname>', result)
 
+    def test_wifi_ssid_in_connection_activation(self):
+        data = b"device (wlp2s0): Activation: (wifi) connection 'Home-WiFi' enable...\n"
+        result = util.redact_text(data)
+        self.assertNotIn(b'Home-WiFi', result)
+        self.assertIn(b"'<ssid>'", result)
+
+    def test_wifi_ssid_in_config_added_value(self):
+        data = b"Config: added 'ssid' value 'Home-WiFi' (9 bytes)\n"
+        result = util.redact_text(data)
+        self.assertNotIn(b'Home-WiFi', result)
+
+    def test_unrelated_quoted_line_kept(self):
+        data = b"apt-get: Unable to fetch some archives, maybe run 'apt-get update'\n"
+        self.assertEqual(util.redact_text(data), data)
+
     def test_credential_line(self):
         data = b'DB_PASSWORD=hunter2\nAuthorization token: abc.def.ghi\n'
         result = util.redact_text(data)
@@ -157,12 +180,15 @@ class TestRedactLogs(TestCase):
         self.assertNotIn(b'192.168.1.5', content)
 
     def test_skips_gz_files(self):
+        # Defensive: dump_logs() no longer collects any .gz files by
+        # default (see TestDumpLogs), but redact_logs() itself still
+        # refuses to rewrite compressed files if one shows up.
         tmp = TempDir()
         original = b'Serial Number: SECRET123\n'  # not real gzip, just needs to survive untouched
-        tmp.makedirs('apt')
-        tmp.write(original, 'apt', 'history-rotated.gz')
+        tmp.makedirs('some')
+        tmp.write(original, 'some', 'file.gz')
         util.redact_logs(tmp.dir)
-        with open(tmp.join('apt', 'history-rotated.gz'), 'rb') as fp:
+        with open(tmp.join('some', 'file.gz'), 'rb') as fp:
             content = fp.read()
         self.assertEqual(content, original)
 
@@ -211,28 +237,71 @@ class TestWriteMetadata(TestCase):
     def test_writes_expected_keys(self):
         tmp = TempDir()
         tmp.write(b'dummy', 'dmesg')
-        util.write_metadata(tmp.dir, unredacted=['apt/history-rotated.gz'])
+        util.write_metadata(tmp.dir)
         with open(tmp.join('metadata.json')) as fp:
             metadata = json.load(fp)
         self.assertEqual(metadata['format_version'], 1)
         self.assertIs(metadata['redacted'], True)
         self.assertIn('dmesg', metadata['collectors'])
-        self.assertEqual(metadata['unredacted'], ['apt/history-rotated.gz'])
+        self.assertEqual(metadata['unredacted'], [])
         self.assertEqual(
             set(metadata['excluded_categories']),
             {'serial_numbers', 'uuids', 'mac_addresses', 'hostname',
              'home_paths', 'ip_addresses', 'credentials'},
         )
 
+    def test_unredacted_names_any_skipped_file(self):
+        tmp = TempDir()
+        util.write_metadata(tmp.dir, unredacted=['some/file.gz'])
+        with open(tmp.join('metadata.json')) as fp:
+            metadata = json.load(fp)
+        self.assertEqual(metadata['unredacted'], ['some/file.gz'])
+
 
 class TestCreateTmpLogsEndToEnd(TestCase):
-    def test_full_pipeline_redacts_and_preserves_gz(self):
+    def test_full_pipeline_leaves_no_sensitive_value_in_the_tar(self):
+        import socket
+        hostname = socket.gethostname() or 'testhostname'
+
+        sensitive = {
+            'dmi serial': 'ABCD1234SERIAL',
+            'system uuid': '4c4c4544-0034-3510-8052-c7c04f503432',
+            'filesystem uuid': '1b4e28ba-2fa1-11d2-883f-0016d3cca427',
+            'partuuid': '9e1e7f3c-01',
+            'mac': '00:1A:2B:3C:4D:5E',
+            'username': 'alice',
+            'ipv4': '192.168.1.42',
+            'ipv6': 'fe80:0:0:0:216:3eff:fe74:3d3e',
+            'ssid': 'Home-WiFi-Network',
+            'credential': 'hunter2super',
+        }
+
         def fake_dump(base):
             with open(path.join(base, 'dmidecode'), 'w') as fp:
-                fp.write('Serial Number: SECRET123\n')
+                fp.write(
+                    'Serial Number: {dmi serial}\n'
+                    'UUID: {system uuid}\n'.format(**sensitive)
+                )
+            with open(path.join(base, 'lsblk'), 'w') as fp:
+                fp.write('NAME FSTYPE MOUNTPOINTS LABEL\nsda1 ext4   /            data\n')
+            with open(path.join(base, 'fstab'), 'w') as fp:
+                fp.write(
+                    'UUID={filesystem uuid} / ext4 defaults 0 1\n'
+                    'PARTUUID={partuuid} /boot vfat defaults 0 2\n'.format(**sensitive)
+                )
+            with open(path.join(base, 'journalctl-NetworkManager'), 'w') as fp:
+                fp.write(
+                    "device (wlp2s0): Activation: (wifi) connection '{ssid}' enable\n"
+                    'eth0: link encap:Ethernet HWaddr {mac}\n'
+                    'inet {ipv4} netmask 255.255.255.0\n'
+                    'inet6 {ipv6}/64\n'.format(**sensitive)
+                )
             os.makedirs(path.join(base, 'apt'))
-            with open(path.join(base, 'apt', 'history-rotated.gz'), 'wb') as fp:
-                fp.write(b'Serial Number: SECRET123\n')  # not real gzip, just needs byte-for-byte survival
+            with open(path.join(base, 'apt', 'history'), 'w') as fp:
+                fp.write(
+                    '/home/{username}/.cache built on {hostname}\n'
+                    'DB_PASSWORD={credential}\n'.format(hostname=hostname, **sensitive)
+                )
 
         SubProcess.reset(mocking=False)
         (tmp, tgz) = util.create_tmp_logs(func=fake_dump)
@@ -241,30 +310,62 @@ class TestCreateTmpLogsEndToEnd(TestCase):
         subprocess.run(['tar', '-xzf', tgz, '-C', extract_dir], check=True)
         base = path.join(extract_dir, 'lud-logs')
 
-        with open(path.join(base, 'dmidecode'), 'rb') as fp:
-            content = fp.read()
-        self.assertNotIn(b'SECRET123', content)
-        self.assertIn(b'<redacted>', content)
+        tar_text = b''
+        for root, _dirs, files in os.walk(base):
+            for name in files:
+                with open(path.join(root, name), 'rb') as fp:
+                    tar_text += fp.read()
 
-        with open(path.join(base, 'apt', 'history-rotated.gz'), 'rb') as fp:
-            gz_content = fp.read()
-        self.assertEqual(gz_content, b'Serial Number: SECRET123\n')
+        for label, value in sensitive.items():
+            self.assertNotIn(value.encode(), tar_text, 'leaked ' + label)
+        self.assertNotIn(hostname.encode(), tar_text)
+
+        for placeholder in (b'<redacted>', b'<uuid>', b'<mac>', b'<ip>', b'<ssid>', b'<hostname>'):
+            self.assertIn(placeholder, tar_text)
 
         with open(path.join(base, 'metadata.json')) as fp:
             metadata = json.load(fp)
         self.assertIn('dmidecode', metadata['collectors'])
-        self.assertIn('apt/history-rotated.gz', metadata['unredacted'])
+        self.assertEqual(metadata['unredacted'], [])
 
         shutil.rmtree(tmp)
 
 
-class TestSendLogs(TestCase):
-    def test_upload_url_does_not_contain_hostname(self):
-        import socket
-        hostname = socket.gethostname()
-        with patch('system76driver.util.subprocess.getstatusoutput') as run:
-            run.return_value = (0, '')
-            util.send_logs()
-        cmd = run.call_args.args[0]
-        if hostname:
-            self.assertNotIn(hostname, cmd)
+class TestDumpLogs(TestCase):
+    def _run_dump_logs(self, tmp):
+        with patch('system76driver.util.subprocess.run') as run, \
+                patch('system76driver.util.determine_model', return_value='test-model'), \
+                patch('system76driver.util.distro.name', return_value='test-distro'), \
+                patch('system76driver.util.os.uname', create=True) as uname:
+            uname.return_value.release = '0.0.0-test'
+            run.return_value.stdout = ''
+            run.return_value.stderr = ''
+            util.dump_logs(tmp.dir)
+        return [call.args[0] for call in run.call_args_list]
+
+    def test_reboot_history_does_not_collect_login_history(self):
+        # 'last' alone lists every login session, including usernames;
+        # 'last reboot' lists only boot/shutdown events.
+        commands = self._run_dump_logs(TempDir())
+        self.assertIn('last reboot', commands)
+        self.assertNotIn('last', commands)
+
+    def test_lsblk_omits_uuid_column(self):
+        commands = self._run_dump_logs(TempDir())
+        lsblk = next(c for c in commands if c.startswith('lsblk'))
+        self.assertNotIn('UUID', lsblk.split(','))
+
+    def test_efibootmgr_is_not_verbose(self):
+        commands = self._run_dump_logs(TempDir())
+        self.assertIn('efibootmgr', commands)
+        self.assertNotIn('efibootmgr -v', commands)
+
+    def test_does_not_collect_raw_syslog_or_rotated_apt_gz(self):
+        tmp = TempDir()
+        self._run_dump_logs(tmp)
+        collected = {
+            path.relpath(path.join(root, name), tmp.dir)
+            for root, _dirs, files in os.walk(tmp.dir) for name in files
+        }
+        self.assertNotIn('syslog', collected)
+        self.assertFalse(any(name.endswith('.gz') for name in collected))
