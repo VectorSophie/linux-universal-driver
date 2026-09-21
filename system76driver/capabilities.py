@@ -31,3 +31,18 @@ import shutil
 def has_command(name):
     """Return True if `name` is an executable found on PATH."""
     return shutil.which(name) is not None
+
+
+def boot_backend():
+    """
+    Return 'kernelstub', 'grub', or None if neither's tooling is present.
+
+    Checks for the command each backend is actually applied with
+    (`kernelstub`, `update-grub`), the same kind of check `has_command()`
+    makes, rather than assuming grub whenever kernelstub is absent.
+    """
+    if has_command('kernelstub'):
+        return 'kernelstub'
+    if has_command('update-grub'):
+        return 'grub'
+    return None
