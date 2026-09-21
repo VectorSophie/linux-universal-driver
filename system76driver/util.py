@@ -21,19 +21,96 @@
 Collect logs and other info for support.
 """
 
+import json
 import os
 from os import path
 import shutil
 import tempfile
 import distro
 import subprocess
+import re
+import socket
+import ipaddress
+import uuid
 
 from .model import *
+
+_IPV6_CANDIDATE_RE = re.compile(rb'\b(?:[0-9A-Fa-f]{1,4})?(?:::?[0-9A-Fa-f]{1,4}){2,7}(?::[0-9A-Fa-f]{1,4})?\b')
+
+
+def _redact_ipv6_candidate(match):
+    token = match.group(0)
+    try:
+        ipaddress.IPv6Address(token.decode('ascii'))
+    except (ValueError, UnicodeDecodeError):
+        return token
+    return b'<ip>'
+
+
+# Every replacement below is a fixed literal placeholder, never the
+# matched value, so nothing sensitive can leak back in through the
+# substitution itself.
+_REDACTIONS = [
+    (re.compile(rb'^([ \t]*(?:Serial Number|UUID|Asset Tag)[ \t]*:[ \t]*).+$',
+                re.IGNORECASE | re.MULTILINE),
+        rb'\1<redacted>'),
+    (re.compile(rb'\b[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-'
+                rb'[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}\b'),
+        rb'<uuid>'),
+    (re.compile(rb'\b(?:[0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}\b'),
+        rb'<mac>'),
+    (re.compile(rb'\b(?!127\.0\.0\.1\b)(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.)'
+                rb'{3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\b'),
+        rb'<ip>'),
+    (_IPV6_CANDIDATE_RE, _redact_ipv6_candidate),
+    (re.compile(rb'/home/[^/\s]+/'),
+        rb'/home/<user>/'),
+    (re.compile(rb'(password|passwd|token|apikey|api_key|secret)([ \t]*[:=][ \t]*)\S+',
+                re.IGNORECASE),
+        rb'\1\2<redacted>'),
+]
+
+
+def redact_text(data):
+    """
+    Replace known-sensitive patterns in `data` (bytes) with fixed placeholders.
+    """
+    for pattern, replacement in _REDACTIONS:
+        data = pattern.sub(replacement, data)
+    hostname = socket.gethostname().encode()
+    if hostname:
+        data = data.replace(hostname, b'<hostname>')
+    return data
+
+
+def redact_logs(base):
+    """
+    Rewrite every file under `base` in place, redacting known-sensitive
+    patterns. Skips .gz files (binary; rewriting risks corrupting them)
+    and returns their base-relative paths so callers can record what
+    wasn't covered.
+    """
+    skipped = []
+    for root, _dirs, files in os.walk(base):
+        for name in files:
+            fp = path.join(root, name)
+            if name.endswith('.gz'):
+                skipped.append(path.relpath(fp, base))
+                continue
+            with open(fp, 'rb') as f:
+                data = f.read()
+            redacted = redact_text(data)
+            if redacted != data:
+                with open(fp, 'wb') as f:
+                    f.write(redacted)
+    return skipped
+
 
 def dump_command(base, name, args):
     fp = open(path.join(base, name), 'xt')
     output = subprocess.run(" ".join(args), capture_output=True, shell=True, text=True)
     fp.write(output.stdout + "\n" + output.stderr)
+
 
 def dump_path(base, name, src):
     if path.exists(src):
@@ -47,6 +124,28 @@ def dump_path(base, name, src):
         else:
             shutil.copy(src, dst)
 
+
+JOURNAL_UNITS = ('NetworkManager', 'systemd-suspend')
+JOURNAL_IDENTIFIERS = ('dkms', 'system76-daemon')
+
+
+def dump_journal(base):
+    """
+    Collect journalctl output scoped to hardware/driver-relevant units and
+    identifiers, instead of the whole system journal. Separate
+    invocations per category rather than one combined match expression:
+    journalctl ANDs different match-field types by default, and getting
+    that boolean grouping wrong would silently drop a whole category
+    (e.g. all kernel messages) rather than error visibly.
+    """
+    since = ['--since', 'yesterday']
+    dump_command(base, 'journalctl-kernel', ['journalctl', '-k'] + since)
+    for unit in JOURNAL_UNITS:
+        dump_command(base, 'journalctl-' + unit, ['journalctl', '-u', unit] + since)
+    for ident in JOURNAL_IDENTIFIERS:
+        dump_command(base, 'journalctl-' + ident, ['journalctl', '-t', ident] + since)
+
+
 def dump_logs(base):
     fp = open(path.join(base, 'systeminfo.txt'), 'x')
     fp.write(' Model: {}\n'.format(determine_model()))
@@ -58,7 +157,7 @@ def dump_logs(base):
     dump_command(base, "dmesg", ["dmesg"])
     dump_command(base, "dmidecode", ["dmidecode"])
     dump_command(base, "efibootmgr", ["efibootmgr", "-v"])
-    dump_command(base, "journalctl", ["journalctl", "--since", "yesterday"])
+    dump_journal(base)
     dump_command(base, "lsblk", ["lsblk", "-o", "NAME,MODEL,FSTYPE,FSVER,SIZE,FSUSE%,MOUNTPOINTS,LABEL,UUID"])
     dump_command(base, "lsmod", ["lsmod"])
     dump_command(base, "lspci", ["lspci", "-vv"])
@@ -80,12 +179,46 @@ def dump_logs(base):
     dump_path(base, "apt/term", "/var/log/apt/term.log")
     dump_path(base, "apt/term-rotated.gz", "/var/log/apt/term.log.1.gz")
 
+
+EXCLUDED_CATEGORIES = [
+    "serial_numbers", "uuids", "mac_addresses", "hostname",
+    "home_paths", "ip_addresses", "credentials",
+]
+
+
+def write_metadata(base, unredacted=()):
+    """
+    Write a small manifest documenting what the bundle collected and
+    what was and wasn't redacted. `collectors` reflects the directory's
+    actual contents at write time rather than a static list, so it can't
+    drift out of sync with dump_logs()/dump_journal(). `unredacted` names
+    any files redact_logs() skipped (currently just .gz files).
+    """
+    collectors = sorted(
+        path.relpath(path.join(root, name), base)
+        for root, _dirs, files in os.walk(base)
+        for name in files
+    )
+    metadata = {
+        "format_version": 1,
+        "redacted": True,
+        "collectors": collectors,
+        "excluded_categories": EXCLUDED_CATEGORIES,
+        "unredacted": sorted(unredacted),
+    }
+    with open(path.join(base, 'metadata.json'), 'w') as fp:
+        json.dump(metadata, fp, indent=2)
+        fp.write('\n')
+
+
 def create_tmp_logs(func=dump_logs):
     tmp = tempfile.mkdtemp(prefix='logs.')
     base = path.join(tmp, 'lud-logs')
     os.mkdir(base)
     if func is not None:
         func(base)
+    unredacted = redact_logs(base)
+    write_metadata(base, unredacted)
     tgz = path.join(tmp, 'lud-logs.tgz')
     cmd = [
         'tar', '-czv',
@@ -95,6 +228,7 @@ def create_tmp_logs(func=dump_logs):
     ]
     subprocess.run(cmd)
     return (tmp, tgz)
+
 
 def create_logs(homedir, func=dump_logs):
     (tmp, src) = create_tmp_logs(func)
@@ -108,10 +242,9 @@ def create_logs(homedir, func=dump_logs):
 def send_logs():
     dst = path.join(os.environ['HOME'], "lud-logs.tgz")
     print(dst)
-    hostname = subprocess.run('hostname', capture_output=True, shell=True, text=True).stdout.strip()
-    desturl = "https://drive.ekimia.fr/public.php/webdav/"+hostname+"-lud-logs.tgz"
+    token = uuid.uuid4().hex[:12]
+    desturl = "https://drive.ekimia.fr/public.php/webdav/"+token+"-lud-logs.tgz"
     Curlcmd = "curl -verbose -X PUT -u 'publicupload:' -T "+dst+" "+desturl
     print(Curlcmd)
     status, output = subprocess.getstatusoutput(Curlcmd)
     print(output)
-

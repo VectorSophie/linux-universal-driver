@@ -22,9 +22,12 @@ Unit tests for `system76driver.util` module.
 """
 
 from unittest import TestCase
+from unittest.mock import patch
+import json
 import os
 from os import path
 import shutil
+import subprocess
 
 from .helpers import TempDir
 from system76driver.mockable import SubProcess
@@ -39,17 +42,229 @@ class TestFunctions(TestCase):
         self.assertTrue(tmp.startswith('/tmp/logs.'))
         self.assertEqual(
             sorted(os.listdir(tmp)),
-            ['system76-logs', 'system76-logs.tgz'],
+            ['lud-logs', 'lud-logs.tgz'],
         )
-        self.assertEqual(tgz, path.join(tmp, 'system76-logs.tgz'))
+        self.assertEqual(tgz, path.join(tmp, 'lud-logs.tgz'))
         self.assertTrue(path.isfile(tgz))
-        self.assertTrue(path.isdir(path.join(tmp, 'system76-logs')))
+        base = path.join(tmp, 'lud-logs')
+        self.assertTrue(path.isdir(base))
+        self.assertIn('metadata.json', os.listdir(base))
+        with open(path.join(base, 'metadata.json')) as fp:
+            metadata = json.load(fp)
+        self.assertIs(metadata['redacted'], True)
         shutil.rmtree(tmp)
 
     def test_create_logs(self):
         SubProcess.reset(mocking=False)
         tmp = TempDir()
         tgz = util.create_logs(tmp.dir, func=None)
-        self.assertEqual(tgz, tmp.join('system76-logs.tgz'))
+        self.assertEqual(tgz, tmp.join('lud-logs.tgz'))
         self.assertTrue(path.isfile(tgz))
 
+
+class TestRedactText(TestCase):
+    def test_dmi_serial_line(self):
+        data = b'System Information\nSerial Number: ABC123XYZ\nManufacturer: Ekimia\n'
+        result = util.redact_text(data)
+        self.assertNotIn(b'ABC123XYZ', result)
+        self.assertIn(b'Serial Number: <redacted>', result)
+
+    def test_dmi_uuid_line(self):
+        data = b'UUID: 4c4c4544-0034-3510-8052-c7c04f503432\n'
+        result = util.redact_text(data)
+        self.assertNotIn(b'4c4c4544-0034-3510-8052-c7c04f503432', result)
+        self.assertIn(b'UUID: <redacted>', result)
+
+    def test_generic_uuid(self):
+        data = b'Filesystem UUID=1b4e28ba-2fa1-11d2-883f-0016d3cca427 mounted\n'
+        result = util.redact_text(data)
+        self.assertNotIn(b'1b4e28ba-2fa1-11d2-883f-0016d3cca427', result)
+        self.assertIn(b'<uuid>', result)
+
+    def test_mac_address(self):
+        data = b'eth0: link encap:Ethernet HWaddr 00:1A:2B:3C:4D:5E\n'
+        result = util.redact_text(data)
+        self.assertNotIn(b'00:1A:2B:3C:4D:5E', result)
+        self.assertIn(b'<mac>', result)
+
+    def test_ipv4_address(self):
+        data = b'inet 192.168.1.42 netmask 255.255.255.0\n'
+        result = util.redact_text(data)
+        self.assertNotIn(b'192.168.1.42', result)
+        self.assertIn(b'<ip>', result)
+
+    def test_loopback_ipv4_kept(self):
+        data = b'inet 127.0.0.1 netmask 255.0.0.0\n'
+        result = util.redact_text(data)
+        self.assertIn(b'127.0.0.1', result)
+
+    def test_ipv6_address(self):
+        data = b'inet6 fe80:0:0:0:216:3eff:fe74:3d3e/64\n'
+        result = util.redact_text(data)
+        self.assertNotIn(b'fe80:0:0:0:216:3eff:fe74:3d3e', result)
+        self.assertIn(b'<ip>', result)
+
+    def test_ipv6_regex_leaves_syslog_timestamp_alone(self):
+        data = b'Sep 12 10:23:45 box kernel: usb 1-1: new device\n'
+        self.assertEqual(util.redact_text(data), data)
+
+    def test_ipv6_regex_leaves_pci_address_alone(self):
+        data = b'0000:00:02.0 VGA compatible controller\n'
+        self.assertEqual(util.redact_text(data), data)
+
+    def test_home_path(self):
+        data = b'/home/alice/.config/foo.conf: No such file or directory\n'
+        result = util.redact_text(data)
+        self.assertNotIn(b'alice', result)
+        self.assertIn(b'/home/<user>/.config/foo.conf', result)
+
+    def test_hostname(self):
+        import socket
+        hostname = socket.gethostname()
+        data = ('journal on ' + hostname + ' rotated\n').encode()
+        result = util.redact_text(data)
+        self.assertNotIn(hostname.encode(), result)
+        self.assertIn(b'<hostname>', result)
+
+    def test_credential_line(self):
+        data = b'DB_PASSWORD=hunter2\nAuthorization token: abc.def.ghi\n'
+        result = util.redact_text(data)
+        self.assertNotIn(b'hunter2', result)
+        self.assertNotIn(b'abc.def.ghi', result)
+
+    def test_unmatched_text_unchanged(self):
+        data = b'nothing sensitive here, just a normal log line\n'
+        self.assertEqual(util.redact_text(data), data)
+
+
+class TestRedactLogs(TestCase):
+    def test_redacts_file_content(self):
+        tmp = TempDir()
+        tmp.write(b'Serial Number: SECRET123\n', 'dmidecode')
+        util.redact_logs(tmp.dir)
+        with open(tmp.join('dmidecode'), 'rb') as fp:
+            content = fp.read()
+        self.assertNotIn(b'SECRET123', content)
+        self.assertIn(b'<redacted>', content)
+
+    def test_recurses_into_subdirectories(self):
+        tmp = TempDir()
+        tmp.makedirs('apt')
+        tmp.write(b'deb http://192.168.1.5/mirror focal main\n', 'apt', 'sources.list')
+        util.redact_logs(tmp.dir)
+        with open(tmp.join('apt', 'sources.list'), 'rb') as fp:
+            content = fp.read()
+        self.assertNotIn(b'192.168.1.5', content)
+
+    def test_skips_gz_files(self):
+        tmp = TempDir()
+        original = b'Serial Number: SECRET123\n'  # not real gzip, just needs to survive untouched
+        tmp.makedirs('apt')
+        tmp.write(original, 'apt', 'history-rotated.gz')
+        util.redact_logs(tmp.dir)
+        with open(tmp.join('apt', 'history-rotated.gz'), 'rb') as fp:
+            content = fp.read()
+        self.assertEqual(content, original)
+
+    def test_leaves_unmatched_files_unchanged(self):
+        tmp = TempDir()
+        original = b'nothing sensitive here\n'
+        tmp.write(original, 'uptime')
+        util.redact_logs(tmp.dir)
+        with open(tmp.join('uptime'), 'rb') as fp:
+            content = fp.read()
+        self.assertEqual(content, original)
+
+
+class TestDumpJournal(TestCase):
+    def test_runs_five_scoped_invocations(self):
+        tmp = TempDir()
+        with patch('system76driver.util.subprocess.run') as run:
+            run.return_value.stdout = ''
+            run.return_value.stderr = ''
+            util.dump_journal(tmp.dir)
+        commands = [call.args[0] for call in run.call_args_list]
+        self.assertEqual(commands, [
+            'journalctl -k --since yesterday',
+            'journalctl -u NetworkManager --since yesterday',
+            'journalctl -u systemd-suspend --since yesterday',
+            'journalctl -t dkms --since yesterday',
+            'journalctl -t system76-daemon --since yesterday',
+        ])
+
+    def test_writes_one_file_per_invocation(self):
+        tmp = TempDir()
+        with patch('system76driver.util.subprocess.run') as run:
+            run.return_value.stdout = ''
+            run.return_value.stderr = ''
+            util.dump_journal(tmp.dir)
+        self.assertEqual(sorted(os.listdir(tmp.dir)), [
+            'journalctl-NetworkManager',
+            'journalctl-dkms',
+            'journalctl-kernel',
+            'journalctl-system76-daemon',
+            'journalctl-systemd-suspend',
+        ])
+
+
+class TestWriteMetadata(TestCase):
+    def test_writes_expected_keys(self):
+        tmp = TempDir()
+        tmp.write(b'dummy', 'dmesg')
+        util.write_metadata(tmp.dir, unredacted=['apt/history-rotated.gz'])
+        with open(tmp.join('metadata.json')) as fp:
+            metadata = json.load(fp)
+        self.assertEqual(metadata['format_version'], 1)
+        self.assertIs(metadata['redacted'], True)
+        self.assertIn('dmesg', metadata['collectors'])
+        self.assertEqual(metadata['unredacted'], ['apt/history-rotated.gz'])
+        self.assertEqual(
+            set(metadata['excluded_categories']),
+            {'serial_numbers', 'uuids', 'mac_addresses', 'hostname',
+             'home_paths', 'ip_addresses', 'credentials'},
+        )
+
+
+class TestCreateTmpLogsEndToEnd(TestCase):
+    def test_full_pipeline_redacts_and_preserves_gz(self):
+        def fake_dump(base):
+            with open(path.join(base, 'dmidecode'), 'w') as fp:
+                fp.write('Serial Number: SECRET123\n')
+            os.makedirs(path.join(base, 'apt'))
+            with open(path.join(base, 'apt', 'history-rotated.gz'), 'wb') as fp:
+                fp.write(b'Serial Number: SECRET123\n')  # not real gzip, just needs byte-for-byte survival
+
+        SubProcess.reset(mocking=False)
+        (tmp, tgz) = util.create_tmp_logs(func=fake_dump)
+        extract_dir = path.join(tmp, 'extracted')
+        os.mkdir(extract_dir)
+        subprocess.run(['tar', '-xzf', tgz, '-C', extract_dir], check=True)
+        base = path.join(extract_dir, 'lud-logs')
+
+        with open(path.join(base, 'dmidecode'), 'rb') as fp:
+            content = fp.read()
+        self.assertNotIn(b'SECRET123', content)
+        self.assertIn(b'<redacted>', content)
+
+        with open(path.join(base, 'apt', 'history-rotated.gz'), 'rb') as fp:
+            gz_content = fp.read()
+        self.assertEqual(gz_content, b'Serial Number: SECRET123\n')
+
+        with open(path.join(base, 'metadata.json')) as fp:
+            metadata = json.load(fp)
+        self.assertIn('dmidecode', metadata['collectors'])
+        self.assertIn('apt/history-rotated.gz', metadata['unredacted'])
+
+        shutil.rmtree(tmp)
+
+
+class TestSendLogs(TestCase):
+    def test_upload_url_does_not_contain_hostname(self):
+        import socket
+        hostname = socket.gethostname()
+        with patch('system76driver.util.subprocess.getstatusoutput') as run:
+            run.return_value = (0, '')
+            util.send_logs()
+        cmd = run.call_args.args[0]
+        if hostname:
+            self.assertNotIn(hostname, cmd)
