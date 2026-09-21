@@ -44,7 +44,11 @@ _SYSTEM_PATH_DIRS = (
 
 def has_command(name):
     """Return True if `name` is an executable on PATH or a standard system directory."""
-    search_path = os.pathsep.join([os.environ.get('PATH', ''), *_SYSTEM_PATH_DIRS])
+    # An empty PATH entry means "current directory" to shutil.which() (same
+    # as a shell), so an unset/empty PATH must not turn into a leading ':'
+    # that lets a same-named file in the caller's cwd shadow the real one.
+    caller_dirs = [entry for entry in os.environ.get('PATH', '').split(os.pathsep) if entry]
+    search_path = os.pathsep.join([*caller_dirs, *_SYSTEM_PATH_DIRS])
     return shutil.which(name, path=search_path) is not None
 
 

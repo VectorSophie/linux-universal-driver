@@ -21,6 +21,7 @@
 Unit tests for `system76driver.capabilities` module.
 """
 
+import os
 from unittest import TestCase
 from unittest.mock import patch
 
@@ -42,3 +43,14 @@ class TestHasCommand(TestCase):
         # only ever asks the filesystem, never a distro name.
         with patch('shutil.which', return_value='/opt/unfamiliar-distro/bin/ethtool'):
             self.assertTrue(capabilities.has_command('ethtool'))
+
+    def test_empty_path_does_not_add_a_cwd_lookup(self):
+        # An empty PATH entry means "current directory" to shutil.which(),
+        # same as a shell; an unset/empty PATH must not turn into a
+        # leading ':' that lets a same-named file in the cwd shadow the
+        # real system executable.
+        with patch.dict(os.environ, {'PATH': ''}), \
+                patch('shutil.which', return_value=None) as which:
+            capabilities.has_command('update-grub')
+        search_path = which.call_args.kwargs['path']
+        self.assertNotIn('', search_path.split(os.pathsep))
