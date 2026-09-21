@@ -133,16 +133,19 @@ def redact_text(data):
 def redact_logs(base):
     """
     Rewrite every file under `base` in place, redacting known-sensitive
-    patterns. Skips .gz files (binary; rewriting risks corrupting them)
-    and returns their base-relative paths so callers can record what
-    wasn't covered.
+    patterns. A file this can't safely redact (currently: .gz, binary and
+    unsafe to rewrite as text) is removed from `base` outright rather than
+    left in place unredacted - a privacy-safe-by-default bundle can't rely
+    on metadata alone to document what it failed to clean. Returns the
+    base-relative paths of anything removed, so callers can record it.
     """
-    skipped = []
+    excluded = []
     for root, _dirs, files in os.walk(base):
         for name in files:
             fp = path.join(root, name)
             if name.endswith('.gz'):
-                skipped.append(path.relpath(fp, base))
+                excluded.append(path.relpath(fp, base))
+                os.remove(fp)
                 continue
             with open(fp, 'rb') as f:
                 data = f.read()
@@ -150,7 +153,7 @@ def redact_logs(base):
             if redacted != data:
                 with open(fp, 'wb') as f:
                     f.write(redacted)
-    return skipped
+    return excluded
 
 
 def dump_command(base, name, args):
@@ -234,13 +237,15 @@ EXCLUDED_CATEGORIES = [
 ]
 
 
-def write_metadata(base, unredacted=()):
+def write_metadata(base, excluded_files=()):
     """
     Write a small manifest documenting what the bundle collected and
-    what was and wasn't redacted. `collectors` reflects the directory's
-    actual contents at write time rather than a static list, so it can't
-    drift out of sync with dump_logs()/dump_journal(). `unredacted` names
-    any files redact_logs() skipped (currently just .gz files).
+    what was redacted. `collectors` reflects the directory's actual
+    contents at write time rather than a static list, so it can't drift
+    out of sync with dump_logs()/dump_journal(). `excluded_files` names
+    anything redact_logs() removed from the bundle rather than risk
+    leaving it unredacted (currently: .gz files) - it documents a bundle
+    that's already clean, it isn't what makes the bundle clean.
     """
     collectors = sorted(
         path.relpath(path.join(root, name), base)
@@ -252,7 +257,7 @@ def write_metadata(base, unredacted=()):
         "redacted": True,
         "collectors": collectors,
         "excluded_categories": EXCLUDED_CATEGORIES,
-        "unredacted": sorted(unredacted),
+        "excluded_files": sorted(excluded_files),
     }
     with open(path.join(base, 'metadata.json'), 'w') as fp:
         json.dump(metadata, fp, indent=2)
@@ -265,8 +270,8 @@ def create_tmp_logs(func=dump_logs):
     os.mkdir(base)
     if func is not None:
         func(base)
-    unredacted = redact_logs(base)
-    write_metadata(base, unredacted)
+    excluded_files = redact_logs(base)
+    write_metadata(base, excluded_files)
     tgz = path.join(tmp, 'lud-logs.tgz')
     cmd = [
         'tar', '-czv',

@@ -231,18 +231,17 @@ class TestRedactLogs(TestCase):
             content = fp.read()
         self.assertNotIn(b'192.168.1.5', content)
 
-    def test_skips_gz_files(self):
-        # Defensive: dump_logs() no longer collects any .gz files by
-        # default (see TestDumpLogs), but redact_logs() itself still
-        # refuses to rewrite compressed files if one shows up.
+    def test_removes_gz_files_instead_of_leaving_them_unredacted(self):
+        # dump_logs() no longer collects any .gz files by default (see
+        # TestDumpLogs), but if one shows up anyway, redact_logs() can't
+        # safely rewrite a compressed file as text - fail closed and
+        # drop it from the bundle rather than ship it unredacted.
         tmp = TempDir()
-        original = b'Serial Number: SECRET123\n'  # not real gzip, just needs to survive untouched
         tmp.makedirs('some')
-        tmp.write(original, 'some', 'file.gz')
-        util.redact_logs(tmp.dir)
-        with open(tmp.join('some', 'file.gz'), 'rb') as fp:
-            content = fp.read()
-        self.assertEqual(content, original)
+        tmp.write(b'Serial Number: SECRET123\n', 'some', 'file.gz')
+        excluded = util.redact_logs(tmp.dir)
+        self.assertFalse(path.exists(tmp.join('some', 'file.gz')))
+        self.assertEqual(excluded, [path.join('some', 'file.gz')])
 
     def test_leaves_unmatched_files_unchanged(self):
         tmp = TempDir()
@@ -295,7 +294,7 @@ class TestWriteMetadata(TestCase):
         self.assertEqual(metadata['format_version'], 1)
         self.assertIs(metadata['redacted'], True)
         self.assertIn('dmesg', metadata['collectors'])
-        self.assertEqual(metadata['unredacted'], [])
+        self.assertEqual(metadata['excluded_files'], [])
         self.assertEqual(
             set(metadata['excluded_categories']),
             {'serial_numbers', 'uuids', 'mac_addresses', 'hostname',
@@ -303,12 +302,12 @@ class TestWriteMetadata(TestCase):
              'user_identity'},
         )
 
-    def test_unredacted_names_any_skipped_file(self):
+    def test_excluded_files_names_any_removed_file(self):
         tmp = TempDir()
-        util.write_metadata(tmp.dir, unredacted=['some/file.gz'])
+        util.write_metadata(tmp.dir, excluded_files=['some/file.gz'])
         with open(tmp.join('metadata.json')) as fp:
             metadata = json.load(fp)
-        self.assertEqual(metadata['unredacted'], ['some/file.gz'])
+        self.assertEqual(metadata['excluded_files'], ['some/file.gz'])
 
 
 class TestCreateTmpLogsEndToEnd(TestCase):
@@ -401,7 +400,31 @@ class TestCreateTmpLogsEndToEnd(TestCase):
         with open(path.join(base, 'metadata.json')) as fp:
             metadata = json.load(fp)
         self.assertIn('dmidecode', metadata['collectors'])
-        self.assertEqual(metadata['unredacted'], [])
+        self.assertEqual(metadata['excluded_files'], [])
+
+        shutil.rmtree(tmp)
+
+    def test_unredactable_file_is_excluded_from_the_final_tar(self):
+        def fake_dump(base):
+            os.makedirs(path.join(base, 'apt', 'sources.list.d'))
+            with open(path.join(base, 'apt', 'sources.list.d', 'extra.list.gz'), 'wb') as fp:
+                fp.write(b'Serial Number: SECRET123\n')  # not real gzip, just needs to not survive
+
+        SubProcess.reset(mocking=False)
+        (tmp, tgz) = util.create_tmp_logs(func=fake_dump)
+        extract_dir = path.join(tmp, 'extracted')
+        os.mkdir(extract_dir)
+        subprocess.run(['tar', '-xzf', tgz, '-C', extract_dir], check=True)
+        base = path.join(extract_dir, 'lud-logs')
+
+        self.assertFalse(path.exists(path.join(base, 'apt', 'sources.list.d', 'extra.list.gz')))
+
+        with open(path.join(base, 'metadata.json')) as fp:
+            metadata = json.load(fp)
+        self.assertEqual(
+            metadata['excluded_files'],
+            [path.join('apt', 'sources.list.d', 'extra.list.gz')],
+        )
 
         shutil.rmtree(tmp)
 
