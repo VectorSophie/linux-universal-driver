@@ -25,6 +25,7 @@ from unittest import TestCase
 from unittest.mock import patch
 import os
 from os import path
+import shutil
 import stat
 from base64 import b32decode, b32encode
 from random import SystemRandom
@@ -614,17 +615,44 @@ class TestGrubAction(TestCase):
 class TestBootBackend(TestCase):
     def test_kernelstub_preferred_when_present(self):
         with patch('system76driver.capabilities.shutil.which',
-                   side_effect=lambda name: '/usr/bin/kernelstub' if name == 'kernelstub' else None):
+                   side_effect=lambda name, path=None: '/usr/bin/kernelstub' if name == 'kernelstub' else None):
             self.assertEqual(capabilities.boot_backend(), 'kernelstub')
 
     def test_grub_when_kernelstub_absent(self):
         with patch('system76driver.capabilities.shutil.which',
-                   side_effect=lambda name: '/usr/sbin/update-grub' if name == 'update-grub' else None):
+                   side_effect=lambda name, path=None: '/usr/sbin/update-grub' if name == 'update-grub' else None):
             self.assertEqual(capabilities.boot_backend(), 'grub')
 
     def test_unsupported_when_neither_present(self):
         with patch('system76driver.capabilities.shutil.which', return_value=None):
             self.assertIsNone(capabilities.boot_backend())
+
+    def test_finds_update_grub_even_when_callers_path_lacks_usr_sbin(self):
+        # GTK's PATH may not include /usr/sbin even though the system (and
+        # the root CLI) has update-grub there; boot_backend() must still
+        # resolve it instead of silently disagreeing with the CLI.
+        real_which = shutil.which
+
+        def restricted_which(name, path=None):
+            # Simulate a caller PATH that only has /usr/bin, while
+            # update-grub actually lives in /usr/sbin.
+            if path and '/usr/sbin' in path.split(os.pathsep) and name == 'update-grub':
+                return '/usr/sbin/update-grub'
+            return None
+
+        with patch('system76driver.capabilities.shutil.which', side_effect=restricted_which):
+            self.assertEqual(capabilities.boot_backend(), 'grub')
+        # sanity: real shutil.which is unaffected by the patch teardown
+        self.assertIs(shutil.which, real_which)
+
+    def test_finds_ethtool_even_when_callers_path_lacks_usr_sbin(self):
+        def restricted_which(name, path=None):
+            if path and '/usr/sbin' in path.split(os.pathsep) and name == 'ethtool':
+                return '/usr/sbin/ethtool'
+            return None
+
+        with patch('system76driver.capabilities.shutil.which', side_effect=restricted_which):
+            self.assertTrue(capabilities.has_command('ethtool'))
 
 
 class TestGrubActionBootBackend(TestCase):

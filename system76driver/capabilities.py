@@ -26,12 +26,26 @@ hardcoded path for `kernelstub`, with no real "neither is available" case.
 the same pattern generalized so other actions can depend on it too.
 """
 
+import os
 import shutil
 
 
+# The GTK UI runs ActionRunner as the unprivileged desktop user, before it
+# launches the privileged CLI that actually applies anything; if that
+# user's PATH happens to omit /usr/sbin (common for non-root shells),
+# has_command() must not disagree with what the root CLI would see there.
+# Search PATH plus these regardless of what the caller's PATH contains.
+_SYSTEM_PATH_DIRS = (
+    '/usr/local/sbin', '/usr/local/bin',
+    '/usr/sbin', '/usr/bin',
+    '/sbin', '/bin',
+)
+
+
 def has_command(name):
-    """Return True if `name` is an executable found on PATH."""
-    return shutil.which(name) is not None
+    """Return True if `name` is an executable on PATH or a standard system directory."""
+    search_path = os.pathsep.join([os.environ.get('PATH', ''), *_SYSTEM_PATH_DIRS])
+    return shutil.which(name, path=search_path) is not None
 
 
 def boot_backend():
