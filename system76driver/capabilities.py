@@ -20,9 +20,10 @@
 """
 Detect actual system capabilities instead of trusting a distro name.
 
-`GrubAction` (see `actions.py`) already picks its backend by checking whether
-`kernelstub` is present rather than by distro name; `has_command()` is that
-same pattern, generalized so other actions can depend on it too.
+`GrubAction` (see `actions.py`) used to pick its backend by checking one
+hardcoded path for `kernelstub`, with no real "neither is available" case.
+`boot_backend()` centralizes that same kind of check; `has_command()` is
+the same pattern generalized so other actions can depend on it too.
 """
 
 import shutil
