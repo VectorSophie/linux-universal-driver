@@ -22,6 +22,7 @@ Unit tests for `system76driver.actions` module.
 """
 
 from unittest import TestCase
+from unittest.mock import patch
 import os
 from os import path
 import stat
@@ -599,6 +600,32 @@ class TestGrubAction(TestCase):
             )
 
             self.assertEqual(SubProcess.calls, [])
+
+
+class Test_energystar_gsettings_override(TestCase):
+    def test_get_isneeded_requires_glib_compile_schemas(self):
+        tmp = TempDir()
+        inst = actions.energystar_gsettings_override(rootdir=tmp.dir)
+
+        # Familiar-looking distro, but the actual capability is missing:
+        with patch('shutil.which', return_value=None):
+            self.assertIs(inst.get_isneeded(), False)
+
+        # Unfamiliar distro name is irrelevant; the capability is present:
+        with patch('shutil.which', return_value='/usr/bin/glib-compile-schemas'):
+            self.assertIs(inst.get_isneeded(), True)
+
+
+class Test_energystar_wakeonlan(TestCase):
+    def test_get_isneeded_requires_ethtool(self):
+        tmp = TempDir()
+        inst = actions.energystar_wakeonlan(rootdir=tmp.dir)
+
+        with patch('shutil.which', return_value=None):
+            self.assertIs(inst.get_isneeded(), False)
+
+        with patch('shutil.which', return_value='/usr/sbin/ethtool'):
+            self.assertIs(inst.get_isneeded(), True)
 
 
 class Test_wifi_pm_disable(TestCase):
