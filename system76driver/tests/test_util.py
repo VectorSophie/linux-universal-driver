@@ -89,6 +89,28 @@ class TestRedactText(TestCase):
         self.assertNotIn(b'9e1e7f3c-01', result)
         self.assertIn(b'PARTUUID=<uuid>', result)
 
+    def test_bare_serial_label(self):
+        data = b'serial: ABCD123456\n'
+        result = util.redact_text(data)
+        self.assertNotIn(b'ABCD123456', result)
+        self.assertIn(b'serial: <redacted>', result)
+
+    def test_lsusb_iserial_descriptor_line(self):
+        data = b'iSerial                 3 ABCD123456\n'
+        result = util.redact_text(data)
+        self.assertNotIn(b'ABCD123456', result)
+        self.assertIn(b'iSerial                 3 <redacted>', result)
+
+    def test_lspci_device_serial_number_capability(self):
+        data = b'Device Serial Number 00-11-22-33-44-55-66-77\n'
+        result = util.redact_text(data)
+        self.assertNotIn(b'00-11-22-33-44-55-66-77', result)
+        self.assertIn(b'Device Serial Number <redacted>', result)
+
+    def test_serial_number_prose_kept(self):
+        data = b'the serial number was reset after the update\n'
+        self.assertEqual(util.redact_text(data), data)
+
     def test_mac_address(self):
         data = b'eth0: link encap:Ethernet HWaddr 00:1A:2B:3C:4D:5E\n'
         result = util.redact_text(data)
@@ -126,6 +148,12 @@ class TestRedactText(TestCase):
         self.assertNotIn(b'alice', result)
         self.assertIn(b'/home/<user>/.config/foo.conf', result)
 
+    def test_home_path_without_trailing_slash(self):
+        data = b'/home/alice\n'
+        result = util.redact_text(data)
+        self.assertNotIn(b'alice', result)
+        self.assertIn(b'/home/<user>', result)
+
     def test_hostname(self):
         import socket
         hostname = socket.gethostname()
@@ -144,6 +172,30 @@ class TestRedactText(TestCase):
         data = b"Config: added 'ssid' value 'Home-WiFi' (9 bytes)\n"
         result = util.redact_text(data)
         self.assertNotIn(b'Home-WiFi', result)
+
+    def test_unquoted_ssid_label(self):
+        data = b'SSID: HomeNetwork\n'
+        result = util.redact_text(data)
+        self.assertNotIn(b'HomeNetwork', result)
+        self.assertIn(b'SSID: <ssid>', result)
+
+    def test_apt_history_requested_by(self):
+        data = b'Requested-By: alice (1000)\n'
+        result = util.redact_text(data)
+        self.assertNotIn(b'alice', result)
+        self.assertIn(b'Requested-By: <redacted>', result)
+
+    def test_apt_source_url_credentials(self):
+        data = b'deb https://alice:s3cret@example.com/repo stable main\n'
+        result = util.redact_text(data)
+        self.assertNotIn(b'alice:s3cret', result)
+        self.assertIn(b'https://<redacted>@example.com/repo stable main', result)
+
+    def test_authorization_header(self):
+        data = b'Authorization: Bearer abc.def.ghi\n'
+        result = util.redact_text(data)
+        self.assertNotIn(b'abc.def.ghi', result)
+        self.assertIn(b'Authorization: <redacted>', result)
 
     def test_unrelated_quoted_line_kept(self):
         data = b"apt-get: Unable to fetch some archives, maybe run 'apt-get update'\n"
@@ -247,7 +299,8 @@ class TestWriteMetadata(TestCase):
         self.assertEqual(
             set(metadata['excluded_categories']),
             {'serial_numbers', 'uuids', 'mac_addresses', 'hostname',
-             'home_paths', 'ip_addresses', 'credentials'},
+             'home_paths', 'ip_addresses', 'credentials', 'wifi_ssids',
+             'user_identity'},
         )
 
     def test_unredacted_names_any_skipped_file(self):
@@ -268,12 +321,17 @@ class TestCreateTmpLogsEndToEnd(TestCase):
             'system uuid': '4c4c4544-0034-3510-8052-c7c04f503432',
             'filesystem uuid': '1b4e28ba-2fa1-11d2-883f-0016d3cca427',
             'partuuid': '9e1e7f3c-01',
+            'usb serial': 'USBSERIAL42',
+            'pci serial': '00-11-22-33-44-55-66-77',
             'mac': '00:1A:2B:3C:4D:5E',
             'username': 'alice',
             'ipv4': '192.168.1.42',
             'ipv6': 'fe80:0:0:0:216:3eff:fe74:3d3e',
             'ssid': 'Home-WiFi-Network',
+            'unquoted ssid': 'HomeNetwork',
             'credential': 'hunter2super',
+            'repo credential': 's3cret',
+            'auth token': 'abc.def.ghi',
         }
 
         def fake_dump(base):
@@ -289,9 +347,18 @@ class TestCreateTmpLogsEndToEnd(TestCase):
                     'UUID={filesystem uuid} / ext4 defaults 0 1\n'
                     'PARTUUID={partuuid} /boot vfat defaults 0 2\n'.format(**sensitive)
                 )
+            with open(path.join(base, 'lsusb'), 'w') as fp:
+                fp.write('Bus 001 Device 003: ID 0bda:8153 Realtek\n')
+            with open(path.join(base, 'lspci'), 'w') as fp:
+                fp.write(
+                    '00:1f.3 Audio device [0403]: Intel Corp [8086:9d71]\n'
+                    'Kernel driver in use: snd_hda_intel\n'
+                    'Capabilities: [178 v1] Device Serial Number {pci serial}\n'.format(**sensitive)
+                )
             with open(path.join(base, 'journalctl-NetworkManager'), 'w') as fp:
                 fp.write(
                     "device (wlp2s0): Activation: (wifi) connection '{ssid}' enable\n"
+                    'SSID: {unquoted ssid}\n'
                     'eth0: link encap:Ethernet HWaddr {mac}\n'
                     'inet {ipv4} netmask 255.255.255.0\n'
                     'inet6 {ipv6}/64\n'.format(**sensitive)
@@ -299,8 +366,16 @@ class TestCreateTmpLogsEndToEnd(TestCase):
             os.makedirs(path.join(base, 'apt'))
             with open(path.join(base, 'apt', 'history'), 'w') as fp:
                 fp.write(
-                    '/home/{username}/.cache built on {hostname}\n'
-                    'DB_PASSWORD={credential}\n'.format(hostname=hostname, **sensitive)
+                    '/home/{username}\n'
+                    'Requested-By: {username} (1000)\n'
+                    'built on {hostname}\n'
+                    'DB_PASSWORD={credential}\n'
+                    'Authorization: Bearer {auth token}\n'.format(hostname=hostname, **sensitive)
+                )
+            with open(path.join(base, 'apt', 'sources.list'), 'w') as fp:
+                fp.write(
+                    'deb https://{username}:{repo credential}@example.com/repo stable main\n'
+                    .format(**sensitive)
                 )
 
         SubProcess.reset(mocking=False)
@@ -359,6 +434,22 @@ class TestDumpLogs(TestCase):
         commands = self._run_dump_logs(TempDir())
         self.assertIn('efibootmgr', commands)
         self.assertNotIn('efibootmgr -v', commands)
+
+    def test_lsusb_is_not_verbose(self):
+        # -vv's descriptor dump is where iSerial values show up; plain
+        # lsusb (bus/device/vendor:product/description) is enough for
+        # hardware identification.
+        commands = self._run_dump_logs(TempDir())
+        self.assertIn('lsusb', commands)
+        self.assertNotIn('lsusb -vv', commands)
+
+    def test_lspci_uses_nnk_not_verbose(self):
+        # -nnk (numeric IDs + kernel driver in use) instead of -vv: same
+        # diagnostic value for driver issues, without -vv's verbose
+        # capability dump (where a device serial number can show up).
+        commands = self._run_dump_logs(TempDir())
+        self.assertIn('lspci -nnk', commands)
+        self.assertNotIn('lspci -vv', commands)
 
     def test_does_not_collect_raw_syslog_or_rotated_apt_gz(self):
         tmp = TempDir()

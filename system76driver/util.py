@@ -64,8 +64,17 @@ def _redact_wifi_line(match):
 # matched value, so nothing sensitive can leak back in through the
 # substitution itself.
 _REDACTIONS = [
-    (re.compile(rb'^([ \t]*(?:Serial Number|UUID|Asset Tag)[ \t]*:[ \t]*).+$',
+    # "Serial Number: X", "serial: X", "iSerial: X" - label/value on one line.
+    (re.compile(rb'^([ \t]*(?:i?Serial(?: Number)?|UUID|Asset Tag)[ \t]*:[ \t]*).+$',
                 re.IGNORECASE | re.MULTILINE),
+        rb'\1<redacted>'),
+    # same labels without a colon: lsusb -vv's "iSerial <index> <value>" and
+    # lspci -vv's "Device Serial Number <value>" capability line. requires a
+    # digit somewhere in the value so plain prose ("the serial number was
+    # five") isn't touched.
+    (re.compile(rb'((?:Device )?(?:i?Serial(?: Number)?)\b[ \t]+(?:\d+[ \t]+)?)'
+                rb'((?=\S*\d)[\w:-]+)',
+                re.IGNORECASE),
         rb'\1<redacted>'),
     (re.compile(rb'\b[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-'
                 rb'[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}\b'),
@@ -81,9 +90,28 @@ _REDACTIONS = [
                 rb'{3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\b'),
         rb'<ip>'),
     (_IPV6_CANDIDATE_RE, _redact_ipv6_candidate),
-    (re.compile(rb'/home/[^/\s]+/'),
-        rb'/home/<user>/'),
+    # matches with or without a trailing slash, so "/home/alice" at the end
+    # of a line is covered as well as "/home/alice/.config/foo.conf".
+    (re.compile(rb'/home/[^/\s]+(/?)'),
+        rb'/home/<user>\1'),
     (_WIFI_LINE_RE, _redact_wifi_line),
+    # unquoted "SSID: <name>" form (iwconfig/iw/nmcli-style), separate from
+    # the quoted NetworkManager-journal forms _WIFI_LINE_RE handles above.
+    (re.compile(rb'^([ \t]*SSID:[ \t]*).+$', re.IGNORECASE | re.MULTILINE),
+        rb'\1<ssid>'),
+    # apt history's "Requested-By: <user> (<uid>)" - keep the rest of the
+    # transaction record (packages, timestamps), drop just the identity.
+    (re.compile(rb'^([ \t]*Requested-By:[ \t]*).+$', re.IGNORECASE | re.MULTILINE),
+        rb'\1<redacted>'),
+    # apt source URL userinfo (deb https://user:pass@host/repo ...) - drop
+    # the credentials, keep the host/path that's actually useful to know.
+    (re.compile(rb'(https?://)[^/\s@]+:[^/\s@]+@'),
+        rb'\1<redacted>@'),
+    # "Authorization: <scheme> <value>" - redact the whole value regardless
+    # of scheme (Bearer/Basic/...), since \S+ below would only take the
+    # scheme word and leave the actual token exposed.
+    (re.compile(rb'^([ \t]*Authorization:[ \t]*).+$', re.IGNORECASE | re.MULTILINE),
+        rb'\1<redacted>'),
     (re.compile(rb'(password|passwd|token|apikey|api_key|secret)([ \t]*[:=][ \t]*)\S+',
                 re.IGNORECASE),
         rb'\1\2<redacted>'),
@@ -179,8 +207,11 @@ def dump_logs(base):
     dump_journal(base)
     dump_command(base, "lsblk", ["lsblk", "-o", "NAME,MODEL,FSTYPE,FSVER,SIZE,FSUSE%,MOUNTPOINTS,LABEL"])
     dump_command(base, "lsmod", ["lsmod"])
-    dump_command(base, "lspci", ["lspci", "-vv"])
-    dump_command(base, "lsusb", ["lsusb", "-vv"])
+    # -nnk / plain instead of -vv: numeric vendor/device IDs and the kernel
+    # driver in use cover hardware/driver diagnosis without the verbose
+    # descriptor dumps (which is where device serial numbers show up).
+    dump_command(base, "lspci", ["lspci", "-nnk"])
+    dump_command(base, "lsusb", ["lsusb"])
     dump_command(base, "reboot-history", ["last", "reboot"])
     dump_command(base, "sensors", ["sensors"])
     dump_command(base, "upower", ["upower"])
@@ -198,7 +229,8 @@ def dump_logs(base):
 
 EXCLUDED_CATEGORIES = [
     "serial_numbers", "uuids", "mac_addresses", "hostname",
-    "home_paths", "ip_addresses", "credentials",
+    "home_paths", "ip_addresses", "credentials", "wifi_ssids",
+    "user_identity",
 ]
 
 
